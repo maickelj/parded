@@ -1,0 +1,766 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <signal.h>
+#include <netinet/in.h>
+#include <linux/ip.h>
+#include <linux/tcp.h>
+#include <linux/udp.h>
+#include <linux/netfilter.h>
+#include <libnetfilter_queue/libnetfilter_queue.h>
+#include <libnfnetlink/libnfnetlink.h>
+#include <pthread.h>
+#include <etcdlib.h>
+#include <arpa/inet.h>
+#include <postgresql/libpq-fe.h> 
+#include <string.h>
+#include <pcap.h>
+
+#define iphdr(x)	((struct iphdr *)(x))
+#define tcphdr(x)	((struct tcphdr *)(x))
+#define udphdr(x)	((struct udphdr *)(x))
+#define PACKETS_PER_CYCLE 200
+#define BLOCKED_THRESHOLD 5
+#define PACKET_LIMIT 10000
+
+#define DNS_LIMIT 200
+
+#define T_A 1 //Ipv4 address
+#define T_NS 2 //Nameserver
+#define T_CNAME 5 // canonical name
+#define T_SOA 6 /* start of authority zone */
+#define T_PTR 12 /* domain name pointer */
+#define T_MX 15 //Mail server
+
+typedef struct blockedCount {
+    __be32 address;
+    uint8_t count;
+} blockedCount_t;
+
+static struct nlif_handle* interfaceHandle;
+static struct nfq_handle *nfqHandle;
+pthread_mutex_t verdictMutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t blockCountMutex = PTHREAD_MUTEX_INITIALIZER;
+
+static blockedCount_t *blocked;
+static uint8_t blockedMaxIndex = 0;
+//static uint8_t packetIndex = 0;
+static volatile unsigned int processedPackets = 0;
+static volatile unsigned int blockedPackets = 0;
+
+PGconn *conn;
+
+typedef struct {
+    unsigned char nome[150];
+    __be32 ip;
+} tuple_dns;
+
+static tuple_dns lista_dns[DNS_LIMIT];
+static int lista_dns_last=0;
+static int lista_dns_first=0;
+
+static volatile int interrupt = 0;
+
+/* DNS:
+-----------------
+    inicios das estruturas e funcoes DNS
+-----------------
+*/
+
+struct DNS_HEADER
+{
+    unsigned short id; // identification number
+
+    unsigned char rd :1; // recursion desired
+    unsigned char tc :1; // truncated message
+    unsigned char aa :1; // authoritive answer
+    unsigned char opcode :4; // purpose of message
+    unsigned char qr :1; // query/response flag
+
+    unsigned char rcode :4; // response code
+    unsigned char cd :1; // checking disabled
+    unsigned char ad :1; // authenticated data
+    unsigned char z :1; // its z! reserved
+    unsigned char ra :1; // recursion available
+
+    unsigned short q_count; // number of question entries
+    unsigned short ans_count; // number of answer entries
+    unsigned short auth_count; // number of authority entries
+    unsigned short add_count; // number of resource entries
+};
+
+struct QUESTION
+{
+    unsigned short qtype;
+    unsigned short qclass;
+};
+
+#pragma pack(push, 1)
+struct R_DATA
+{
+    unsigned short type;
+    unsigned short _class;
+    unsigned int ttl;
+    unsigned short data_len;
+};
+#pragma pack(pop)
+
+struct RES_RECORD
+{
+    unsigned char *name;
+    struct R_DATA *resource;
+    unsigned char *rdata;
+};
+ 
+//Structure of a Query
+typedef struct
+{
+    unsigned char *name;
+    struct QUESTION *ques;
+} QUERY;
+
+struct RES_IPV4
+{
+    unsigned int ipv4;
+};
+
+
+u_char* ReadName(unsigned char* reader,unsigned char* buffer,int* count)
+{
+    unsigned char *name;
+    unsigned int p=0,jumped=0,offset;
+    int i , j;
+ 
+    *count = 1;
+    name = (unsigned char*)malloc(256);
+ 
+    name[0]='\0';
+ 
+    //read the names in 3www6google3com format
+    while(*reader!=0)
+    {
+        if(*reader>=192)
+        {
+            offset = (*reader)*256 + *(reader+1) - 49152; //49152 = 11000000 00000000 ;)
+            reader = buffer + offset - 1;
+            jumped = 1; //we have jumped to another location so counting wont go up!
+        }
+        else
+        {
+            name[p++]=*reader;
+        }
+ 
+        reader = reader+1;
+ 
+        if(jumped==0)
+        {
+            *count = *count + 1; //if we havent jumped to another location then we can count up
+        }
+    }
+ 
+    name[p]='\0'; //string complete
+    if(jumped==1)
+    {
+        *count = *count + 1; //number of steps we actually moved forward in the packet
+    }
+ 
+    //now convert 3www6google3com0 to www.google.com
+            //    www.            
+    for(i=0;i<(int)strlen((const char*)name);i++) 
+    {
+        p=name[i];
+        for(j=0;j<(int)p;j++) 
+        {
+            name[i]=name[i+1];
+            i=i+1;
+        }
+        name[i]='.';
+    }
+    name[i-1]='\0'; //remove the last dot
+    return name;
+}
+
+/*
+------------
+    fim das estruturas DNS
+------------
+*/
+
+
+void stopExecution(int _){
+    printf("Received SIGINT!\n");
+    interrupt = 1;
+}
+
+
+static void listTuples(void) {
+    //printf("==========\nTuple count is %d\n", lista_dns_last-lista_dns_first);
+    //for (int i = lista_dns_first; i < lista_dns_last; ++i)
+    //    printf("   [%s] -> %d\n", lista_dns_count[i].nome, lista_dns_count[i].ip);
+    //puts("==========");
+}
+
+static void addIPDNS(unsigned char *str, __be32 address) {
+    if (sizeof(str)>50){
+        strncpy(lista_dns[lista_dns_last].nome, str,49);
+        lista_dns[lista_dns_last].nome[49]='\0';
+    }else
+        strcpy(lista_dns[lista_dns_last].nome, str);
+
+    //printf("Adding '%s', mapped to %d\n", str, val);
+    lista_dns[lista_dns_last].ip = address;
+    lista_dns_last++;
+    
+    if (lista_dns_last>= DNS_LIMIT)  //rotaciona
+        lista_dns_last = 0;
+    
+    if (lista_dns_last == lista_dns_first){ //o inicial vai ser sobrescrito pelo final. Avança o inicial
+        lista_dns_first++;
+        if (lista_dns_first>= DNS_LIMIT) //rotaciona
+            lista_dns_first = 0;
+    }
+}
+
+/*static void deleteTuple(char *str) {
+    int index = 0;
+    while (index < tupleCount) {
+        if (strcmp(str, tuple[index].strVal) == 0) break;
+        ++index;
+    }
+    if (index == tupleCount) return;
+
+    printf("Deleting '%s', mapped to %d\n", str, tuple[index].intVal);
+    if (index != tupleCount - 1) {
+        strcpy(tuple[index].strVal, tuple[tupleCount - 1].strVal);
+        tuple[index].intVal = tuple[tupleCount - 1].intVal;
+    }
+    --tupleCount;
+}*/
+
+static int searchIP(unsigned int address) {
+    int i;
+    if (lista_dns_last > lista_dns_first){
+        for (i=lista_dns_first; i<lista_dns_last; i++){
+            if (address == lista_dns[i].ip){
+                return i;
+            }
+        }
+    } else{
+        for (i=0; i<lista_dns_last; i++){
+            if (address == lista_dns[i].ip){
+                return i;
+            }
+        }
+        for (i=lista_dns_first; i<DNS_LIMIT; i++){
+            if (address == lista_dns[i].ip){
+                return i;
+            }
+        }
+    }
+    //nao achou
+    return -1;
+}
+
+static unsigned char * getDNSInfo(int pos){
+    //aqui deveria ser feito check de existencia
+    return lista_dns[pos].nome;
+}
+
+static bool getDNSInfoFromPKT(unsigned char *buf){
+    struct DNS_HEADER *dns = NULL;
+    unsigned char name[150],*qname, *reader,*q;
+    struct R_DATA *answer;
+    //unsigned char ip_hex[20][5];
+    int i,j,p,n_resp_ok=0;//,stop;
+    //struct sockaddr_in a; 
+    struct RES_IPV4 *ipv4;   
+
+    dns = (struct DNS_HEADER*) buf;
+    qname = buf +sizeof(struct DNS_HEADER);
+    reader = buf +sizeof(struct DNS_HEADER) + strlen((const char*)qname)+1 + sizeof(struct QUESTION);
+    
+
+    printf("\nThe response contains : ");
+    printf("\n %d Questions.",ntohs(dns->q_count));
+    printf("\n %d Answers.\n",ntohs(dns->ans_count));
+
+    //now convert 3www6google3com0 to www.google.com
+    q = qname;
+    for(i=0;i<(int)strlen((const char*)qname);i++) 
+    {
+        p = (int)(*q);
+        printf("%d - %s\n",p,name);
+        for(j=0;j<p;j++) 
+        {
+            q++;
+            name[i]=*q;
+            i=i+1;
+        }
+        name[i]='.';
+        q++;
+    }
+    name[i-1]='\0'; //remove the last dot
+    printf("%s %s\n",qname,name);
+
+
+    //pega todas as respostas
+    if (ntohs(dns->ans_count)>0){
+        q = reader;
+        for (i=0; i<ntohs(dns->ans_count);i++){
+            q = q+2; //pula a busca pelo nome do dominio que gerou o IP de resposta
+            answer = (struct R_DATA *)(q);
+            q = q + sizeof(struct R_DATA); //coloca no inicio do IP
+            if(ntohs(answer->type) == 1 && ntohs(answer->data_len) == 4){//if its an ipv4 address
+                    //for(j=0; j<ntohs(answer->data_len); j++){
+                    //    printf("%2x ",*q);
+                    //    ip_hex[i][j]=(*q);
+                    //    q++;
+                    //}
+                ipv4 = (struct RES_IPV4 *)(q);
+                //printf("%2x - %u",*q,ipv4->ipv4);
+                if (searchIP(ntohl(ipv4->ipv4)) == -1)
+                    addIPDNS(name,ntohl(ipv4->ipv4));
+                //ip_hex[i][j]='\0';
+                n_resp_ok=1;
+            }
+            q+= ntohs(answer->data_len);   
+        }
+    }
+    //printf("\n");
+    //for (i=0; i<ntohs(dns->ans_count);i++){
+    //    printf("%s - %d.%d.%d.%d\n",name,ip_hex[i][0],ip_hex[i][1],ip_hex[i][2],ip_hex[i][3]);
+    //}
+    if (n_resp_ok)
+        return true;
+
+    return false;
+}
+
+
+
+static void printDNSInfo(){
+    int i;
+    if (lista_dns_last >= lista_dns_first){
+        for (i=lista_dns_first; i<lista_dns_last; i++){
+            printf("%8x - %s\n",lista_dns[i].ip,lista_dns[i].nome);
+        }
+    } else{
+        for (i=0; i<lista_dns_last; i++){
+            printf("%8x - %s\n",lista_dns[i].ip,lista_dns[i].nome);
+        }
+        for (i=lista_dns_first; i<DNS_LIMIT; i++){
+            printf("%8x - %s\n",lista_dns[i].ip,lista_dns[i].nome);
+        }
+    }
+}
+
+
+static int compareAddress(const void *a, const void *b){
+    return ((blockedCount_t *) a)->address - ((blockedCount_t *) b)->address;
+}
+
+static uint8_t insertBlocked(__be32 *address){
+    qsort(blocked, blockedMaxIndex, sizeof(*blocked), compareAddress);
+    blockedCount_t *blockedItem = bsearch(address, blocked, blockedMaxIndex, sizeof(*blocked), compareAddress);
+    if (blockedItem){
+        blockedItem->count += 1;
+        return blockedItem->count;
+    }
+    blockedCount_t newCount = {.address = *address, .count = 1};
+    blocked[blockedMaxIndex++] = newCount;
+    return 1;
+}
+
+
+
+//static uint8_t process_pkt_sniffer(unsigned char *data){
+void process_pkt_sniffer(u_char *useless,const struct pcap_pkthdr* header,const u_char*data){
+    int ret=header->len;
+	//unsigned char *data;
+    
+    //ret = nfq_get_payload(tb, &data);
+	if (ret >= 0) {
+        struct iphdr *iph;
+        unsigned int localPort = 0;
+        unsigned int remotePort = 0;
+        __be32 localAddress;
+        __be32 remoteAddress;
+        unsigned int proto = 1;
+        bool isFromLAN = true;
+        bool rootkit = false;
+
+        //DEBUG: imprime cabecalho do pacote
+        printf("\n\n");
+        const unsigned char * p=data;
+        for (int i=0; i<ret;i++,p++){
+            if (i%16 == 0)
+                printf("\n");
+            printf("%2x ",*p);
+        }
+
+
+        iph = iphdr(data);
+        int iplen = iph->ihl*4;
+        proto = iph->protocol;
+
+
+        localAddress = ntohl(iph->saddr);
+        remoteAddress = ntohl(iph->daddr);
+        //ip 192.168 = c0.a8 em binario  (endereco local)
+        if ( ((remoteAddress >> 16) & 0x0000FFFF) == 0xc0a8){
+            //remote address inverte os endereços remoto e local
+            isFromLAN = false;
+            localAddress = ntohl(iph->daddr);
+            remoteAddress = ntohl(iph->saddr);
+        }
+  
+        //printf("%8x %8x\n", remoteAddress, localAddress);
+
+
+        if (proto == IPPROTO_TCP) {
+            struct tcphdr *tcph;
+            tcph = tcphdr(data + iplen);
+            if (isFromLAN){
+                localPort = tcph->source;
+                remotePort = tcph->dest;
+            } else {
+                localPort = tcph->dest;
+                remotePort = tcph->source;
+            }
+        } else if (proto == IPPROTO_UDP) {
+            struct udphdr *udph;
+            udph = udphdr(data + iplen);
+            if (isFromLAN){
+                localPort = udph->source;
+                remotePort = udph->dest;
+            } else {
+                localPort = udph->dest;
+                remotePort = udph->source;
+            }
+        }
+		localPort = ntohs(localPort);
+		remotePort = ntohs(remotePort);
+/*
+		unsigned char bytes[4];
+        char caIp[16];
+        bytes[0] = localAddress & 0xFF;
+        bytes[1] = (localAddress >> 8) & 0xFF;
+        bytes[2] = (localAddress >> 16) & 0xFF;
+        bytes[3] = (localAddress >> 24) & 0xFF;
+        sprintf(caIp, "%d.%d.%d.%d", bytes[3], bytes[2], bytes[1], bytes[0]);
+        etcdlib_t *collectorAgent;
+        collectorAgent = etcdlib_create(caIp, 4001,
+                                        ETCDLIB_NO_CURL_INITIALIZATION);
+  */     
+	    char key[35];
+        char remoteAddressKey[15];
+        //sprintf(remoteAddressKey, "%u", remoteAddress);
+        sprintf(remoteAddressKey, "%u", remoteAddress);
+        //printf("Remote address key is %x\n", remoteAddress);
+        if(localAddress < remoteAddress) {
+            sprintf(key, "%u%u%u%u%u",
+                    localAddress, localPort,
+                    remoteAddress, remotePort,
+                    proto);
+        } else {
+            sprintf(key, "%u%u%u%u%u",
+                    remoteAddress, remotePort,
+                    localAddress, localPort,
+                    proto);
+        }
+
+        //char *exist = NULL;
+        //char *banned = NULL;
+        char *domain;
+        //int mod;
+        PGresult   *res;
+        //int nTuples,i,j;
+        int j;
+        // printf("Asking collector on %s:%d for key %s\n", etcdlib_host(collectorAgent),
+        //       etcdlib_port(collectorAgent), key);
+//        printf("%s ", key);
+
+//        printf("%d ",
+
+    /*    for (uint8_t count = 0;count < 40;count++) {
+            if(interrupt)
+                break;
+
+           etcdlib_get(collectorAgent, remoteAddressKey, &banned, &mod);
+            if (banned != NULL){
+                if (banned[0] == 'b'){
+                    printf("This IP is already banned! Rejecting %s from %s.\n", key, caIp);
+                    verdict = NF_DROP;
+                    break;
+                }
+            }
+
+            etcdlib_get(collectorAgent, key, &exist, &mod);//);
+            if (exist == NULL) {
+                //printf("%d \n", count);
+                usleep(40000);
+                continue;
+            }
+            //printf("Exist is: %s", exist);
+            if (exist[0] == 'o') {
+                verdict = NF_ACCEPT;
+                break;
+            }
+        }
+      */
+        if (rootkit){
+            char rAK[100];
+            sprintf(rAK,"SELECT id FROM ips_maliciosos WHERE ip = '%d.%d.%d.%d';",
+                    (remoteAddress >> 24) & 0x000000FF,
+                    (remoteAddress >> 16) & 0x000000FF,
+                    (remoteAddress >> 8 ) & 0x000000FF,
+                    remoteAddress & 0x000000FF);
+            printf("%s\n", rAK);
+            res = PQexec(conn, rAK);
+
+            if (PQresultStatus(res) != PGRES_TUPLES_OK){
+                printf("Erro na execucao da busca no Banco de Dados\n");
+            }
+            else {
+                //nTuples = PQntuples(res);
+                if (PQntuples(res) > 0){
+                    sprintf(rAK, "SELECT count,size FROM clientes WHERE id_fk = %d AND ip = '%d.%d.%d.%d';", atoi(PQgetvalue(res, 0, 0)),
+                            (localAddress >> 24) & 0x000000FF,
+                            (localAddress >> 16) & 0x000000FF,
+                            (localAddress >> 8 ) & 0x000000FF,
+                            localAddress & 0x000000FF);
+                    PQclear(res);
+                    res = PQexec(conn, rAK);
+                    if (PQresultStatus(res) == PGRES_TUPLES_OK){
+                        if (PQntuples(res) > 0){
+                            //faz update
+                            printf("Update cliente");
+                        } else {
+                            //faz insert
+                            printf("Insert cliente");
+                        }
+                    }
+
+                    //verifica se existe o IP na lista em memoria de DNS. Se sim, pega o nome do dominio
+                    j = searchIP(remoteAddress);
+                    if (j!=-1){
+                        domain = getDNSInfo(j);
+                        sprintf(rAK, "SELECT dominio FROM dominios WHERE id_fk = %d AND dominio = '%s';", atoi(PQgetvalue(res, 0, 0)),getDNSInfo(j));
+                        PQclear(res);
+                        res = PQexec(conn, rAK);
+                        if (PQresultStatus(res) == PGRES_TUPLES_OK){
+                            if (PQntuples(res) > 0){
+                                printf("Update dominio");
+                            }else  {
+                                //faz insert
+                                printf("Insert dominio");
+                            }
+                        }
+                    }
+                }
+                else {
+                    printf("nada encontrado no DB\n");
+                }
+                
+                /*else {
+                    for (i = 0; i < PQntuples(res); i++)
+                    {
+                        for (j = 0; j < nFields; j++)
+                            printf("%-15s", PQgetvalue(res, i, j));
+                        printf("\n");
+                    }
+                }*/
+            }
+            PQclear(res);
+        }
+        else {
+            /*if (proto == IPPROTO_UDP) {
+                struct udphdr *udph;
+                udph = udphdr(data + iplen);
+                if (ntohs(udph->source) == 53){ //DNS
+                    //executa DNS
+                    getDNSInfoFromPKT(data+iplen+8);
+                }
+            }*/
+            //para testes, coloquei a funcao fora do IF com buf (buffer) local de um pacote DNS valido
+            getDNSInfoFromPKT(data+iplen+8);
+        }
+
+/*
+        //pthread_mutex_lock(&blockCountMutex);
+        if (verdict == NF_DROP){
+            blockedPackets++;
+            // printf("Rejected key %s from %s\n", key, caIp);
+            uint8_t blockedPackagesInCycle = insertBlocked(&remoteAddress);
+            // printf("This IP was blocked %d time(s) in the last 200 packages.\n", blockedPackagesInCycle);
+            if (blockedPackagesInCycle > BLOCKED_THRESHOLD){
+                printf("Blocking %s definitively!\n", key);
+//                iint ok = etcdlib_set(collectorAgent, remoteAddressKey, "b", 0, false);
+            }
+        } 
+        if (++packetIndex == PACKETS_PER_CYCLE){   // && blockedMaxIndex > 0){
+            printf("Processed 200 packets, resetting!\n");
+            packetIndex = 0;
+            printf("The following IP's were blocked:\n");
+            for (uint8_t c = 0; c < blockedMaxIndex; c ++)
+                printf("%u: %d times\n", blocked[c].address, blocked[c].count);
+
+            blockedMaxIndex = 0;
+            free(blocked);
+            blocked = (blockedCount_t *)calloc(PACKETS_PER_CYCLE/2, sizeof(blockedCount_t));
+        }
+*/
+        //pthread_mutex_unlock(&blockCountMutex);
+//        etcdlib_destroy(collectorAgent);
+	}
+	//    putc('a', stdout);
+	//    putc('\n', stdout);
+    
+
+//    return verdict;
+}
+
+
+
+
+int main(int argc, char **argv){
+
+   	char buf[4096] __attribute__ ((aligned));
+    struct nfq_q_handle *queueHandle;
+    int rv, fd;
+
+    char dev[] = "enp0s8\0";
+    char errbuf[PCAP_ERRBUF_SIZE];
+    char filter_string[] = "udp src port 53\0"; //resp
+    struct bpf_program fp;
+    pcap_t *handle;
+    //struct pcap_pkthdr header;
+    const u_char *packet,*p;
+
+    /*
+     *verifica se é posśivel finalizar a execução (CTRL+C). Será necessário para finalizar a captura
+    */
+    if(signal(SIGINT, stopExecution)!=0){
+        fprintf(stderr, "Unable to catch SIGINT!");
+        exit(3);
+    }
+
+
+    /*
+     *inicia banco de dados
+     */
+    conn = PQconnectdb("host=localhost user=aadb password=aadb dbname=conexoes"); 
+    if (PQstatus(conn) == CONNECTION_OK) {
+       printf("Conexão no Banco de dados com efetuada com sucesso.");
+    }
+    else{
+      printf("Falha na conexão ao Banco de Dados.");
+      PQfinish(conn);
+      exit(4);
+    }
+
+
+    /*
+     *inicia sistema de captura de pacotes PCAP
+     */
+    handle = pcap_open_live(dev, BUFSIZ, 1, 1000, errbuf);
+    if (handle == NULL) {
+        fprintf(stderr, "Couldn't open device %s: %s\n", dev, errbuf);
+        return(2);
+    }
+
+    if (pcap_compile(handle, &fp, filter_string, 0, PCAP_NETMASK_UNKNOWN) == -1) {
+        fprintf(stderr, "Couldn't parse filter %s: %s\n", filter_string, pcap_geterr(handle));
+        return(2);
+    }
+    if (pcap_setfilter(handle, &fp) == -1) {
+        fprintf(stderr, "Couldn't install filter %s: %s\n", filter_string, pcap_geterr(handle));
+        return(2);
+    }
+
+    //inicia captura (thread)
+    pcap_loop(handle,10,process_pkt_sniffer,NULL);
+
+    
+    //packet = pcap_next(handle, &header);
+	/* Print its length */
+	//printf("Jacked a packet with length of [%d]\n", header.len);
+	/* And close the session */
+
+    //p=packet;
+    //for (int i=0; i<header.len;i++,p++){
+    //    if (i%16 == 0)
+    //        printf("\n");
+    //    printf("%2x ",*p);
+    //}
+   // printf("\n");
+
+    //process_pkt_sniffer(packet+14);
+
+
+        
+
+/*
+    printf("Getting interface handle\n");
+    interfaceHandle = nlif_open();
+    if (interfaceHandle == NULL) {
+        perror("nlif_open");
+        exit(EXIT_FAILURE);
+    }
+    nlif_query(interfaceHandle);
+
+	printf("opening library handle\n");
+	nfqHandle = nfq_open();
+	if (!nfqHandle) {
+		fprintf(stderr, "error during nfq_open()\n");
+		exit(EXIT_FAILURE);
+	}
+	printf("unbinding existing nf_queue handler for AF_INET (if any)\n");
+	if (nfq_unbind_pf(nfqHandle, AF_INET) < 0) {
+		fprintf(stderr, "nfq_unbind_pf(): sem fila alocada\n");
+		exit(EXIT_FAILURE);
+	}
+	printf("binding nfnetlink_queue as nf_queue handler for AF_INET\n");
+	if (nfq_bind_pf(nfqHandle, AF_INET) < 0) {
+		fprintf(stderr, "error during nfq_bind_pf()\n");
+		exit(EXIT_FAILURE);
+	}
+
+    queueHandle = nfq_create_queue(nfqHandle, 0, &cb, NULL);
+    if (!queueHandle) {
+        fprintf(stderr, "error during nfq_create_queue()\n");
+        exit(EXIT_FAILURE);
+    }
+    printf("setting copy_packet mode\n");
+    if (nfq_set_mode(queueHandle, NFQNL_COPY_PACKET, 0x0078) < 0) {
+        fprintf(stderr, "can't set packet_copy mode\n");
+        exit(EXIT_FAILURE);
+    }
+
+    fd = nfq_fd(nfqHandle);
+
+
+	while ((rv = recv(fd, buf, sizeof(buf), 0)) && rv >= 0 && !interrupt) {
+        printf("pkt received");
+		nfq_handle_packet(nfqHandle, buf, rv);
+	}
+
+
+    printf("Unbinding from queue %d\n", 0);
+    nfq_destroy_queue(queueHandle);
+
+    printf("Closing interace handle\n");
+    nlif_close(interfaceHandle);
+
+	printf("closing library handle\n");
+	nfq_close(nfqHandle);
+*/
+    PQfinish(conn);
+
+    printf("Lista de DNS recebidos:\n");
+    printDNSInfo();
+
+    pcap_close(handle);
+
+	exit(0);
+}

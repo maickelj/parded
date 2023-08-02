@@ -1,0 +1,369 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <signal.h>
+#include <netinet/in.h>
+#include <linux/ip.h>
+#include <linux/tcp.h>
+#include <linux/udp.h>
+#include <linux/netfilter.h>
+#include <libnetfilter_queue/libnetfilter_queue.h>
+#include <libnfnetlink/libnfnetlink.h>
+#include <pthread.h>
+#include <etcdlib.h>
+#include <arpa/inet.h>
+#include <postgresql/libpq-fe.h> 
+
+#define iphdr(x)	((struct iphdr *)(x))
+#define tcphdr(x)	((struct tcphdr *)(x))
+#define udphdr(x)	((struct udphdr *)(x))
+#define PACKETS_PER_CYCLE 200
+#define BLOCKED_THRESHOLD 5
+#define PACKET_LIMIT 10000
+
+
+typedef struct blockedCount {
+    __be32 address;
+    uint8_t count;
+} blockedCount_t;
+
+static struct nlif_handle* interfaceHandle;
+static struct nfq_handle *nfqHandle;
+pthread_mutex_t verdictMutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t blockCountMutex = PTHREAD_MUTEX_INITIALIZER;
+
+static blockedCount_t *blocked;
+static uint8_t blockedMaxIndex = 0;
+static uint8_t packetIndex = 0;
+static volatile unsigned int processedPackets = 0;
+static volatile unsigned int blockedPackets = 0;
+
+PGconn *conn = NULL;
+
+static volatile int interrupt = 0;
+void stopExecution(int _){
+    printf("Received SIGINT!\n");
+    interrupt = 1;
+}
+
+static int compareAddress(const void *a, const void *b){
+    return ((blockedCount_t *) a)->address - ((blockedCount_t *) b)->address;
+}
+
+static uint8_t insertBlocked(__be32 *address){
+    qsort(blocked, blockedMaxIndex, sizeof(*blocked), compareAddress);
+    blockedCount_t *blockedItem = bsearch(address, blocked, blockedMaxIndex, sizeof(*blocked), compareAddress);
+    if (blockedItem){
+        blockedItem->count += 1;
+        return blockedItem->count;
+    }
+    blockedCount_t newCount = {.address = *address, .count = 1};
+    blocked[blockedMaxIndex++] = newCount;
+    return 1;
+}
+
+static uint8_t process_pkt (struct nfq_data *tb)
+{
+    int ret;
+	unsigned char *data;
+    char devName[IFNAMSIZ]; // brlan if package from local
+    bool isFromLAN = false;
+    uint8_t verdict = NF_DROP;
+
+    u_int32_t ifi = nfq_get_indev(tb);
+    if (ifi) {
+        nlif_index2name(interfaceHandle, ifi, devName);
+        printf("%s ",devName);
+	isFromLAN = devName[0] == 'b';
+    }
+
+    ret = nfq_get_payload(tb, &data);
+	if (ret >= 0) {
+        struct iphdr *iph;
+        unsigned int localPort = 0;
+        unsigned int remotePort = 0;
+        __be32 localAddress;
+        __be32 remoteAddress;
+        unsigned int proto = 1;
+
+        iph = iphdr(data);
+        int iplen = iph->ihl*4;
+        proto = iph->protocol;
+
+        if (isFromLAN){
+            localAddress = ntohl(iph->saddr);
+            remoteAddress = ntohl(iph->daddr);
+        } else {
+            localAddress = ntohl(iph->daddr);
+            remoteAddress = ntohl(iph->saddr);
+        }
+
+        if (proto == IPPROTO_TCP) {
+            struct tcphdr *tcph;
+            tcph = tcphdr(data + iplen);
+            if (isFromLAN){
+                localPort = tcph->source;
+                remotePort = tcph->dest;
+            } else {
+                localPort = tcph->dest;
+                remotePort = tcph->source;
+            }
+        } else if (proto == IPPROTO_UDP) {
+            struct udphdr *udph;
+            udph = udphdr(data + iplen);
+            if (isFromLAN){
+                localPort = udph->source;
+                remotePort = udph->dest;
+            } else {
+                localPort = udph->dest;
+                remotePort = udph->source;
+            }
+        }
+		localPort = ntohs(localPort);
+		remotePort = ntohs(remotePort);
+/*
+		unsigned char bytes[4];
+        char caIp[16];
+        bytes[0] = localAddress & 0xFF;
+        bytes[1] = (localAddress >> 8) & 0xFF;
+        bytes[2] = (localAddress >> 16) & 0xFF;
+        bytes[3] = (localAddress >> 24) & 0xFF;
+        sprintf(caIp, "%d.%d.%d.%d", bytes[3], bytes[2], bytes[1], bytes[0]);
+        etcdlib_t *collectorAgent;
+        collectorAgent = etcdlib_create(caIp, 4001,
+                                        ETCDLIB_NO_CURL_INITIALIZATION);
+  */     
+	char key[35];
+        char remoteAddressKey[15];
+        //sprintf(remoteAddressKey, "%u", remoteAddress);
+        sprintf(remoteAddressKey, "%u", remoteAddress);
+        printf("Remote address key is %x\n", remoteAddress);
+        if(localAddress < remoteAddress) {
+            sprintf(key, "%u%u%u%u%u",
+                    localAddress, localPort,
+                    remoteAddress, remotePort,
+                    proto);
+        } else {
+            sprintf(key, "%u%u%u%u%u",
+                    remoteAddress, remotePort,
+                    localAddress, localPort,
+                    proto);
+        }
+
+        char *exist = NULL;
+        char *banned = NULL;
+        int mod;
+        PGresult   *res;
+        int nFields,i,j;
+        // printf("Asking collector on %s:%d for key %s\n", etcdlib_host(collectorAgent),
+        //       etcdlib_port(collectorAgent), key);
+//        printf("%s ", key);
+
+//        printf("%d ",
+
+    /*    for (uint8_t count = 0;count < 40;count++) {
+            if(interrupt)
+                break;
+
+           etcdlib_get(collectorAgent, remoteAddressKey, &banned, &mod);
+            if (banned != NULL){
+                if (banned[0] == 'b'){
+                    printf("This IP is already banned! Rejecting %s from %s.\n", key, caIp);
+                    verdict = NF_DROP;
+                    break;
+                }
+            }
+
+            etcdlib_get(collectorAgent, key, &exist, &mod);//);
+            if (exist == NULL) {
+                //printf("%d \n", count);
+                usleep(40000);
+                continue;
+            }
+            //printf("Exist is: %s", exist);
+            if (exist[0] == 'o') {
+                verdict = NF_ACCEPT;
+                break;
+            }
+        }
+      */
+        char rAK[80];
+            sprintf(rAK,"SELECT * FROM ips_maliciosos WHERE ip = '%d.%d.%d.%d';",
+            (remoteAddress & 0xFF000000) >> 24,
+            (remoteAddress & 0x00FF0000) >> 16,
+            (remoteAddress & 0x0000FF00) >> 8,
+            remoteAddress & 0x000000FF);
+        printf("%s\n", rAK);
+        res = PQexec(conn, rAK);
+
+        if (PQresultStatus(res) != PGRES_TUPLES_OK){
+            printf("Erro na execucao da busca no Banco de Dados\n");
+        }
+        else {
+            nFields = PQnfields(res);
+            for (i = 0; i < PQntuples(res); i++)
+            {
+                for (j = 0; j < nFields; j++)
+                    printf("%-15s", PQgetvalue(res, i, j));
+                printf("\n");
+            }
+        }
+        PQclear(res);
+
+
+        pthread_mutex_lock(&blockCountMutex);
+        if (verdict == NF_DROP){
+            blockedPackets++;
+            // printf("Rejected key %s from %s\n", key, caIp);
+            uint8_t blockedPackagesInCycle = insertBlocked(&remoteAddress);
+            // printf("This IP was blocked %d time(s) in the last 200 packages.\n", blockedPackagesInCycle);
+            if (blockedPackagesInCycle > BLOCKED_THRESHOLD){
+                printf("Blocking %s definitively!\n", key);
+//                iint ok = etcdlib_set(collectorAgent, remoteAddressKey, "b", 0, false);
+            }
+        } 
+        if (++packetIndex == PACKETS_PER_CYCLE){   // && blockedMaxIndex > 0){
+            printf("Processed 200 packets, resetting!\n");
+            packetIndex = 0;
+            printf("The following IP's were blocked:\n");
+            for (uint8_t c = 0; c < blockedMaxIndex; c ++)
+                printf("%u: %d times\n", blocked[c].address, blocked[c].count);
+
+            blockedMaxIndex = 0;
+            free(blocked);
+            blocked = (blockedCount_t *)calloc(PACKETS_PER_CYCLE/2, sizeof(blockedCount_t));
+        }
+        pthread_mutex_unlock(&blockCountMutex);
+//        etcdlib_destroy(collectorAgent);
+	}
+	//    putc('a', stdout);
+	//    putc('\n', stdout);
+    
+
+//    return verdict;
+    return NF_ACCEPT;
+}
+	
+
+static int cb(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg, struct nfq_data *nfa, void *data)
+{
+//    printf("entering callback\n");
+    uint8_t verdict = process_pkt(nfa);
+    struct nfqnl_msg_packet_hdr *ph;
+	ph = nfq_get_msg_packet_hdr(nfa);
+    u_int32_t id = ntohl(ph->packet_id);
+
+	pthread_mutex_lock(&verdictMutex);
+    processedPackets++;
+	int verdictSet = nfq_set_verdict(qh, id, verdict, 0, NULL);
+    pthread_mutex_unlock(&verdictMutex);
+	return verdictSet;
+}
+
+static void *read_thread(void *fd) {
+    int rv;
+    char buf[4096] __attribute__ ((aligned));
+    while (!interrupt && (rv = recv(fd, buf, sizeof(buf), 0))){
+		nfq_handle_packet(nfqHandle, buf, rv);
+	}
+    pthread_exit(0);
+}
+
+int main(int argc, char **argv){
+    if(signal(SIGINT, stopExecution)!=0){
+        fprintf(stderr, "Unable to catch SIGINT!");
+        exit(3);
+    }
+    struct nfq_q_handle *queueHandles[3];
+    pthread_t threads[3];
+    int fds[3],
+        maxPackets=10000;
+    blocked = (blockedCount_t *)calloc(PACKETS_PER_CYCLE/2, sizeof(blockedCount_t));
+
+    if (argc == 2){
+        maxPackets = atoi(argv[1]);
+    }
+
+
+
+    conn = PQconnectdb("host=localhost user=aadb password=aadb dbname=conexoes"); 
+    if(PQstatus(conn) == CONNECTION_OK) {
+       printf("Conexão no Banco de dados com efetuada com sucesso.");
+    }
+    else{
+      printf("Falha na conexão ao Banco de Dados.");
+      PQfinish(conn);
+      return -1;
+    }
+
+
+    printf("Getting interface handle\n");
+    interfaceHandle = nlif_open();
+    if (interfaceHandle == NULL) {
+        perror("nlif_open");
+        exit(EXIT_FAILURE);
+    }
+    nlif_query(interfaceHandle);
+
+	printf("opening library handle\n");
+	nfqHandle = nfq_open();
+	if (!nfqHandle) {
+		fprintf(stderr, "error during nfq_open()\n");
+		exit(1);
+	}
+	printf("unbinding existing nf_queue handler for AF_INET (if any)\n");
+	if (nfq_unbind_pf(nfqHandle, AF_INET) < 0) {
+		fprintf(stderr, "nfq_unbind_pf(): sem fila alocada\n");
+		exit(1);
+	}
+	printf("binding nfnetlink_queue as nf_queue handler for AF_INET\n");
+	if (nfq_bind_pf(nfqHandle, AF_INET) < 0) {
+		fprintf(stderr, "error during nfq_bind_pf()\n");
+		exit(1);
+	}
+
+    printf("Creating threads\n");
+    for(int i=0; i<1; i++){
+        queueHandles[i] = nfq_create_queue(nfqHandle, i, &cb, NULL);
+        if (!queueHandles[i]) {
+            fprintf(stderr, "error during nfq_create_queue()\n");
+            exit(1);
+        }
+        printf("setting copy_packet mode\n");
+        if (nfq_set_mode(queueHandles[i], NFQNL_COPY_PACKET, 0x0078) < 0) {
+            fprintf(stderr, "can't set packet_copy mode\n");
+            exit(1);
+        }
+        fds[i] = nfq_fd(nfqHandle);
+        if(pthread_create(&(threads[i]), NULL, read_thread, fds[i])){
+            fprintf(stderr, "can't create thread\n");
+            exit(1);
+        }
+    }
+
+	
+
+    while(processedPackets < maxPackets && !interrupt);
+    if (maxPackets == 0)
+        while (!interrupt);
+        
+    interrupt=1;
+    printf("Done processing %d packets\n%d packets were blocked.\n", processedPackets, blockedPackets);
+
+    for(int i=0; i<1; i++){
+        printf("Ending thread %d\n", i);
+        pthread_join(threads[i], NULL);
+        printf("Unbinding from queue %d\n", i);
+        nfq_destroy_queue(queueHandles[i]);
+    }
+
+    printf("Closing interace handle\n");
+    nlif_close(interfaceHandle);
+
+	printf("closing library handle\n");
+	nfq_close(nfqHandle);
+
+      PQfinish(conn);
+
+	exit(3);
+}

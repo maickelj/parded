@@ -1,0 +1,40 @@
+cmake_minimum_required(VERSION 3.15)
+project(auditoragent)
+SET(IN_OPENWRT $ENV{IN_OPENWRT})
+
+set(CMAKE_CXX_STANDARD 11)
+
+set(BINARY ${CMAKE_PROJECT_NAME})
+include_directories(lib)
+
+#file(GLOB_RECURSE SOURCES LIST_DIRECTORIES true *.h *.c)
+set(SOURCES auditoragent.c)#${SOURCES})
+
+add_library(etcdlib STATIC lib/etcdlib.h lib/etcd.c lib/etcd.h)
+target_link_libraries(etcdlib -ljansson)
+add_executable(${BINARY} ${SOURCES} lib/etcdlib.h)
+
+IF (IN_OPENWRT)
+    ADD_DEFINITIONS("$ENV{TARGET_LDFLAGS}" "$ENV{TARGET_CPPFLAGS}" "$ENV{TARGET_CFLAGS}")
+#    INCLUDE_DIRECTORIES(/usr/include/libhellocmakemm "$ENV{TARGET_LDFLAGS}" "$ENV{TARGET_CPPFLAGS}" "$ENV{TARGET_CFLAGS}")
+    target_link_libraries(${BINARY} etcdlib)
+    target_link_libraries(${BINARY} -lnetfilter_queue "$ENV{TARGET_LDFLAGS}")
+    target_link_libraries(${BINARY} -lmnl "$ENV{TARGET_LDFLAGS}")
+    target_link_libraries(${BINARY} -lnfnetlink "$ENV{TARGET_LDFLAGS}")
+    target_link_libraries(${BINARY} -lpthread "$ENV{TARGET_LDFLAGS}")
+    target_link_libraries(${BINARY} -lcurl "$ENV{TARGET_LDFLAGS}")
+#    SET_TARGET_PROPERTIES(${BINARY} PROPERTIES LINK_FLAGS "")
+#    SET_TARGET_PROPERTIES(${BINARY} PROPERTIES COMPILE_FLAGS "-I $ENV{STAGING_DIR}/usr/include/uClibc++")
+ELSE (IN_OPENWRT)
+    ADD_DEFINITIONS("-Wall -g")
+    target_link_libraries(${BINARY} etcdlib)
+    target_link_libraries(${BINARY} -lnetfilter_queue "$ENV{TARGET_LDFLAGS}")
+    target_link_libraries(${BINARY} -lmnl "$ENV{TARGET_LDFLAGS}")
+    target_link_libraries(${BINARY} -lnfnetlink "$ENV{TARGET_LDFLAGS}")
+    target_link_libraries(${BINARY} -lpthread "$ENV{TARGET_LDFLAGS}")
+    target_link_libraries(${BINARY} -lcurl "$ENV{TARGET_LDFLAGS}")
+    INSTALL(PROGRAMS ${BINARY} DESTINATION /usr/local/bin)
+    ADD_CUSTOM_TARGET(uninstall
+            COMMAND "rm" -f "/usr/local/bin/${BINARY}"
+            )
+ENDIF(IN_OPENWRT)
