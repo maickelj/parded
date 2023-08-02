@@ -28,5 +28,5 @@ Necessita as seguindes bibliotecas: dash, plotly, pandas, psycopg2, geoip2, psut
 
 ## Stix visualizar:
 
-A viusualização dos arquivos STX é feita através do projeto https://github.com/oasis-open/cti-stix-visualization
+A visualização dos arquivos STIX é feita através do projeto https://github.com/oasis-open/cti-stix-visualization
 O codigo utilizado está na pasta "assets"
